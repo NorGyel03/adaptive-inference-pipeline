@@ -1,0 +1,15 @@
+#Ignore model files
+*.pt
+*.onnx
+
+#Ignore caches
+_pycache_/
+*.pyc
+
+#Ignore OS /IDE junk
+.vscode/
+.idea/
+.DS_Store
+
+#Ignore environment files
+.env
