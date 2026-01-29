@@ -8,7 +8,7 @@ import struct
 # =========================
 # CONFIG
 # =========================
-YOLO_MODEL_PATH = "best0.pt"
+YOLO_MODEL_PATH = "best.pt"
 RESNET_ONNX_PATH = "resnet50_waste_classifier.onnx"
 VIT_ONNX_PATH = "vit_waste_classifier.onnx"
 
@@ -26,6 +26,8 @@ CLASSIFICATION_HOLD_TIME = 10.0
 
 live_object_count = 0        # updated every YOLO frame
 frozen_object_count = None  # latched value
+
+analysis_boxes = []   # stores all YOLO boxes for ANALYSIS display
 
 
 import psutil
@@ -192,13 +194,13 @@ def main():
         if state == "ANALYSIS":
             detections = yolo(frame, conf=0.4, verbose=False)[0]
 
-            boxes = detections.boxes.xyxy.cpu().numpy() if detections.boxes else []
+            analysis_boxes = detections.boxes.xyxy.cpu().numpy() if detections.boxes else []
             confs = detections.boxes.conf.cpu().numpy() if detections.boxes else []
 
-            live_object_count = len(boxes)
+            live_object_count = len(analysis_boxes)
 
             # Track highest confidence detection
-            for box, conf in zip(boxes, confs):
+            for box, conf in zip(analysis_boxes, confs):
                 if conf > best_conf:
                     best_conf = conf
                     best_bbox = box.astype(int)
@@ -208,7 +210,8 @@ def main():
                 state = "CLASSIFY"
                 state_start_time = now
 
-                frozen_object_count = live_object_count  # 🔒 latch count ONCE
+                frozen_object_count = live_object_count
+                analysis_boxes = [] 
 
                 # Choose classifier ONCE
                 if frozen_object_count <= SCENE_THRESHOLD:
@@ -241,11 +244,19 @@ def main():
 
 
         # =========================
-        # DRAWING
-        # =========================
-        if best_bbox is not None:
+# DRAWING
+# =========================
+
+        # ---- ANALYSIS: draw ALL detected boxes ----
+        if state == "ANALYSIS":
+            for box in analysis_boxes:
+                x1, y1, x2, y2 = map(int, box)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # ---- CLASSIFY / FREEZE: draw ONLY best box ----
+        elif state == "CLASSIFY" and best_bbox is not None:
             x1, y1, x2, y2 = best_bbox
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
 
             if classified_label is not None:
                 cv2.putText(
@@ -254,14 +265,19 @@ def main():
                     (x1, y1 - 8),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
-                    (0, 255, 0),
+                    (0, 0, 255),
                     2
                 )
 
+        # =========================
+        # SYSTEM OVERLAY
+        # =========================
         cpu, gpu = get_system_stats()
 
-        cv2.putText(frame, f"State: {state}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(
+            frame, f"State: {state}", (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2
+        )
 
         display_count = (
             live_object_count if state == "ANALYSIS"
@@ -269,33 +285,31 @@ def main():
         )
 
         cv2.putText(
-            frame,
-            f"Objects: {display_count}",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2
+            frame, f"Objects: {display_count}", (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
         )
 
+        cv2.putText(
+            frame, f"Model: {model_used}", (10, 90),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
+        )
 
-        cv2.putText(frame, f"Model: {model_used}", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-        cv2.putText(frame, f"CPU: {cpu:.1f}%", (480, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+        cv2.putText(
+            frame, f"CPU: {cpu:.1f}%", (480, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2
+        )
 
         if gpu is not None:
-            cv2.putText(frame, f"GPU: {gpu}%", (480, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+            cv2.putText(
+                frame, f"GPU: {gpu}%", (480, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2
+            )
 
         cv2.imshow("ESP32 Adaptive Inference", frame)
 
         if cv2.waitKey(1) & 0xFF in [27, ord('q')]:
             break
 
-    ser.close()
-    cv2.destroyAllWindows()
 
 
 # =========================
