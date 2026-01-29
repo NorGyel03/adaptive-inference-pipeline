@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from ultralytics import YOLO
+import serial
+import struct
 
 # =========================
 # CONFIG
@@ -10,8 +12,53 @@ YOLO_MODEL_PATH = "best0.pt"
 RESNET_ONNX_PATH = "resnet50_waste_classifier.onnx"
 VIT_ONNX_PATH = "vit_waste_classifier.onnx"
 
-SCENE_THRESHOLD = 5
+SERIAL_PORT = "COM3"      # CHANGE if needed
+BAUD_RATE = 2_000_000
+
+SCENE_THRESHOLD = 2
 INPUT_SIZE = 224
+
+WINDOW_WIDTH = 640
+WINDOW_HEIGHT = 480
+
+YOLO_ANALYSIS_TIME = 10.0     # seconds
+CLASSIFICATION_HOLD_TIME = 10.0
+
+live_object_count = 0        # updated every YOLO frame
+frozen_object_count = None  # latched value
+
+
+import psutil
+
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    GPU_AVAILABLE = True
+except:
+    GPU_AVAILABLE = False
+
+
+def get_system_stats():
+    cpu = psutil.cpu_percent(interval=None)
+
+    gpu = None
+    if GPU_AVAILABLE:
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        util = pynvml.nvmlDeviceGetUtilizationRates(h)
+        gpu = util.gpu
+
+    return cpu, gpu
+
+import time
+
+state = "ANALYSIS"
+state_start_time = time.time()
+
+frozen_object_count = 0
+best_bbox = None
+best_conf = 0.0
+classified_label = None
+model_used = None
 
 # =========================
 # LOAD MODELS
@@ -29,6 +76,13 @@ vit_sess = ort.InferenceSession(
 )
 
 print("[INFO] Models loaded successfully")
+
+# =========================
+# SERIAL CAMERA INIT
+# =========================
+print("[INFO] Connecting to ESP32 camera...")
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+print("[INFO] ESP32 camera connected")
 
 # =========================
 # PREPROCESS
@@ -85,51 +139,164 @@ def adaptive_inference(frame):
     return object_count, model_used, results
 
 # =========================
-# CAMERA LOOP
+# ESP32 FRAME READER
 # =========================
-def main():
-    cap = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
-        print("[ERROR] Camera not accessible")
-        return
-
+def read_esp32_frame():
+    # Wait for JPEG start marker
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        if ser.read(2) == b'\xff\xd8':
             break
 
-        count, model, results = adaptive_inference(frame)
+    size_bytes = ser.read(4)
+    if len(size_bytes) != 4:
+        return None
 
-        for x1, y1, x2, y2, cls in results:
+    size = struct.unpack('<I', size_bytes)[0]
+    jpg = ser.read(size)
+
+    if len(jpg) != size:
+        return None
+
+    img = cv2.imdecode(
+        np.frombuffer(jpg, dtype=np.uint8),
+        cv2.IMREAD_COLOR
+    )
+
+    return img
+
+# =========================
+# MAIN LOOP
+# =========================
+def main():
+    global state, state_start_time
+    global frozen_object_count, best_bbox, best_conf
+    global classified_label, model_used
+
+    cv2.namedWindow("ESP32 Adaptive Inference", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("ESP32 Adaptive Inference", WINDOW_WIDTH, WINDOW_HEIGHT)
+
+    while True:
+        frame = read_esp32_frame()
+        if frame is None:
+            continue
+
+        frame = cv2.resize(frame, (WINDOW_WIDTH, WINDOW_HEIGHT))
+        now = time.time()
+
+        # =========================
+        # PHASE 1: YOLO ANALYSIS
+        # =========================
+        # =========================
+        # STATE MACHINE
+        # =========================
+        if state == "ANALYSIS":
+            detections = yolo(frame, conf=0.4, verbose=False)[0]
+
+            boxes = detections.boxes.xyxy.cpu().numpy() if detections.boxes else []
+            confs = detections.boxes.conf.cpu().numpy() if detections.boxes else []
+
+            live_object_count = len(boxes)
+
+            # Track highest confidence detection
+            for box, conf in zip(boxes, confs):
+                if conf > best_conf:
+                    best_conf = conf
+                    best_bbox = box.astype(int)
+
+            # ----- TRANSITION: ANALYSIS → FREEZE -----
+            if now - state_start_time > YOLO_ANALYSIS_TIME:
+                state = "CLASSIFY"
+                state_start_time = now
+
+                frozen_object_count = live_object_count  # 🔒 latch count ONCE
+
+                # Choose classifier ONCE
+                if frozen_object_count <= SCENE_THRESHOLD:
+                    model_used = "ViT"
+                    classifier = classify_vit
+                else:
+                    model_used = "ResNet50"
+                    classifier = classify_resnet
+
+                # Run classification ONCE
+                if best_bbox is not None:
+                    x1, y1, x2, y2 = best_bbox
+                    crop = frame[y1:y2, x1:x2]
+                    classified_label = classifier(crop)
+
+        # =========================
+        # FREEZE / CLASSIFY STATE
+        # =========================
+        else:
+            # ----- TRANSITION: FREEZE → ANALYSIS -----
+            if now - state_start_time > CLASSIFICATION_HOLD_TIME:
+                state = "ANALYSIS"
+                state_start_time = now
+
+                # Reset only what must be recomputed
+                best_conf = 0.0
+                best_bbox = None
+                classified_label = None
+                frozen_object_count = None
+
+
+        # =========================
+        # DRAWING
+        # =========================
+        if best_bbox is not None:
+            x1, y1, x2, y2 = best_bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                frame,
-                f"Class {cls}",
-                (x1, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0),
-                2
-            )
+
+            if classified_label is not None:
+                cv2.putText(
+                    frame,
+                    f"Class {classified_label}",
+                    (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2
+                )
+
+        cpu, gpu = get_system_stats()
+
+        cv2.putText(frame, f"State: {state}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+        display_count = (
+            live_object_count if state == "ANALYSIS"
+            else frozen_object_count
+        )
 
         cv2.putText(
             frame,
-            f"Objects: {count} | Model: {model}",
-            (10, 30),
+            f"Objects: {display_count}",
+            (10, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
+            0.7,
+            (0, 255, 255),
             2
         )
 
-        cv2.imshow("Adaptive Inference Pipeline", frame)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.putText(frame, f"Model: {model_used}", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        cv2.putText(frame, f"CPU: {cpu:.1f}%", (480, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+
+        if gpu is not None:
+            cv2.putText(frame, f"GPU: {gpu}%", (480, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+
+        cv2.imshow("ESP32 Adaptive Inference", frame)
+
+        if cv2.waitKey(1) & 0xFF in [27, ord('q')]:
             break
 
-    cap.release()
+    ser.close()
     cv2.destroyAllWindows()
+
 
 # =========================
 # ENTRY POINT

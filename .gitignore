@@ -13,3 +13,7 @@ _pycache_/
 
 #Ignore environment files
 .env
+
+edge_ai/
+venv/
+.env/
